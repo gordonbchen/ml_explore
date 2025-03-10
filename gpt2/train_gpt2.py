@@ -55,7 +55,7 @@ class GPT(nn.Module):
 
     @torch.no_grad()
     def generate(self, prompt: str, n_sequences: int, max_length: int) -> list[str]:
-        model.eval()
+        self.eval()
 
         tok = tiktoken.get_encoding("gpt2")
         tokens = torch.tensor(tok.encode(prompt), dtype=torch.long, device="cuda")
@@ -92,7 +92,7 @@ class GPT(nn.Module):
             if not (k.endswith(".attn.causal_mask") or k.endswith("pos_arange"))
         ]
 
-        # BUG: hf fails to find cache if not in same dir.
+        # BUG: hf fails to find cache if not running script in same dir.
         model_hf = GPT2LMHeadModel.from_pretrained(model_name)
         sd_hf = model_hf.state_dict()
         assert sd_keys == list(sd_hf.keys()), "gpt state dict doesn't match huggingface reference"
