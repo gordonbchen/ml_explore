@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
+import requests
 import tiktoken
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.optim import AdamW
 from transformers import GPT2LMHeadModel
 
 
@@ -37,7 +40,20 @@ class GPT(nn.Module):
             }
         )
         self.lm_head = nn.Linear(config.n_embed, config.vocab_size, bias=False)
+        self.transformer.wte.weight = self.lm_head.weight
         self.register_buffer("pos_arange", torch.arange(config.block_size, dtype=torch.long))
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module: nn.Module) -> None:
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, "RESIDUAL_SCALE_INIT"):
+                std *= (2 * self.config.n_layers) ** -0.5
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T = x.shape
@@ -52,6 +68,11 @@ class GPT(nn.Module):
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
         return logits
+
+    def calc_loss(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        logits = self(x)
+        loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), y.view(-1))
+        return loss
 
     @torch.no_grad()
     def generate(self, prompt: str, n_sequences: int, max_length: int) -> list[str]:
@@ -139,6 +160,7 @@ class CausalSelfAttention(nn.Module):
         self.head_size = config.n_embed // config.n_heads
         self.c_attn = nn.Linear(config.n_embed, config.n_embed * 3)
         self.c_proj = nn.Linear(config.n_embed, config.n_embed)
+        self.c_proj.RESIDUAL_SCALE_INIT = 1
         self.register_buffer(
             "causal_mask",
             torch.triu(
@@ -171,6 +193,7 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embed, config.n_embed * 4)
         self.gelu = nn.GELU(approximate="tanh")
         self.c_proj = nn.Linear(config.n_embed * 4, config.n_embed)
+        self.c_proj.RESIDUAL_SCALE_INIT = 1
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.c_fc(x)
@@ -179,11 +202,61 @@ class MLP(nn.Module):
         return x
 
 
-if __name__ == "__main__":
-    model = GPT.from_pretrained("gpt2").to("cuda")
+class DataLoaderLite:
+    def __init__(self, B: int, T: int) -> None:
+        self.B = B
+        self.T = T
+        tok = tiktoken.get_encoding("gpt2")
+        text = self.get_shakespeare_data()
+        self.tokens = torch.tensor(tok.encode(text), device="cuda")
+        print(f"# tokens: {len(self.tokens)}")
+        print(f"batches per epoch: {len(self.tokens) // (B * T)}")
+        self.curr_pos = 0
 
-    torch.manual_seed(42)
-    torch.cuda.manual_seed(42)
+    def get_next_batch(self) -> torch.Tensor:
+        buf = self.tokens[self.curr_pos : self.curr_pos + (self.B * self.T) + 1]
+        x = buf[:-1].view(self.B, self.T)
+        y = buf[1:].view(self.B, self.T)
+
+        self.curr_pos += self.B * self.T
+        if (self.curr_pos + (self.B * self.T) + 1) > len(self.tokens):
+            self.curr_pos = 0
+        return x, y
+
+    def get_shakespeare_data(self, path: str = "data/tiny_shakespeare.txt") -> str:
+        path = Path(path)
+        if not path.exists():
+            path.parent.mkdir(exist_ok=True)
+            text = requests.get(
+                "https://raw.githubusercontent.com/karpathy/char-rnn/refs/heads/master/data/tinyshakespeare/input.txt"
+            ).text
+            with open(path, "w") as f:
+                f.write(text)
+            return text
+
+        with open(path, "r") as f:
+            text = f.read()
+        return text
+
+
+if __name__ == "__main__":
+    torch.manual_seed(1337)
+
+    config = GPTConfig()
+    model = GPT(config).to("cuda")
+    optim = AdamW(model.parameters(), lr=3e-4)
+    train_data = DataLoaderLite(B=4, T=32)
+
+    model.train()
+    for i in range(50):
+        x, y = train_data.get_next_batch()
+        x, y = x.to("cuda"), y.to("cuda")
+        loss = model.calc_loss(x, y)
+        optim.zero_grad()
+        loss.backward()
+        optim.step()
+        print(loss.item())
+
     completions = model.generate("Hello, I'm a language model,", n_sequences=4, max_length=64)
     for c in completions:
         print("<", c)
