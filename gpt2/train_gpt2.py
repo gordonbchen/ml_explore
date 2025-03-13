@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import math
+import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 import requests
 import tiktoken
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
 from transformers import GPT2LMHeadModel
 
@@ -15,7 +19,7 @@ from transformers import GPT2LMHeadModel
 @dataclass
 class GPTConfig:
     block_size: int = 1024
-    vocab_size: int = 50257
+    vocab_size: int = 50_257
     n_layers: int = 12
     n_heads: int = 12
     n_embed: int = 768
@@ -161,13 +165,13 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embed, config.n_embed * 3)
         self.c_proj = nn.Linear(config.n_embed, config.n_embed)
         self.c_proj.RESIDUAL_SCALE_INIT = 1
-        self.register_buffer(
-            "causal_mask",
-            torch.triu(
-                torch.full((1, 1, config.block_size, config.block_size), float("-inf")),
-                diagonal=1,
-            ),
-        )
+        # self.register_buffer(
+        #     "causal_mask",
+        #     torch.triu(
+        #         torch.full((1, 1, config.block_size, config.block_size), float("-inf")),
+        #         diagonal=1,
+        #     ),
+        # )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         q, k, v = self.c_attn(x).split(self.n_embed, dim=-1)
@@ -177,10 +181,11 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_heads, self.head_size).transpose(1, 2)
         v = v.view(B, T, self.n_heads, self.head_size).transpose(1, 2)
 
-        affin = (q @ k.transpose(-1, -2)) * (k.shape[-1] ** -0.5)
-        affin = affin + self.causal_mask[:, :, :T, :T]
-        affin = F.softmax(affin, dim=-1)
-        y = affin @ v
+        # affin = (q @ k.transpose(-1, -2)) * (k.shape[-1] ** -0.5)
+        # affin = affin + self.causal_mask[:, :, :T, :T]
+        # affin = F.softmax(affin, dim=-1)
+        # y = affin @ v
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
@@ -239,24 +244,83 @@ class DataLoaderLite:
         return text
 
 
+def get_lr_scheduler(
+    max_lr: float, min_lr: float, warmup_steps: int, max_steps: int
+) -> Callable[[int], float]:
+    def lr_scheduler(step: int) -> float:
+        if step < warmup_steps:
+            return max_lr * (step + 1) / warmup_steps
+        if step > max_steps:
+            return min_lr
+
+        decay_ratio = (step - warmup_steps) / (max_steps - warmup_steps)
+        assert (0 <= decay_ratio) and (decay_ratio <= 1)
+        coeff = 0.5 * (1.0 + math.cos(decay_ratio * math.pi))
+        return min_lr + (coeff * (max_lr - min_lr))
+
+    return lr_scheduler
+
+
+def config_optim(model: GPT, lr: float, weight_decay: float) -> AdamW:
+    decay_params = []
+    no_decay_params = []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if p.dim() >= 2:
+            decay_params.append(p)
+        else:
+            no_decay_params.append(p)
+
+    print(f"Total params: {sum(p.numel() for p in model.parameters())}")
+    print(f"Decayed tensors, params: {len(decay_params)}, {sum(p.numel() for p in decay_params)}")
+    print(
+        f"Non-decayed tensors, params: {len(no_decay_params)}, {sum(p.numel() for p in no_decay_params)}"
+    )
+
+    optim_groups = [
+        {"params": decay_params, "weight_decay": weight_decay},
+        {"params": no_decay_params, "weight_decay": 0.0},
+    ]
+
+    optim = AdamW(optim_groups, lr=lr, betas=(0.9, 0.95), eps=1e-8, fused=True)
+    return optim
+
+
 if __name__ == "__main__":
     torch.manual_seed(1337)
+    torch.set_float32_matmul_precision("high")
 
-    config = GPTConfig()
-    model = GPT(config).to("cuda")
-    optim = AdamW(model.parameters(), lr=3e-4)
-    train_data = DataLoaderLite(B=4, T=32)
+    config = GPTConfig(vocab_size=50_304)
+    model = torch.compile(GPT(config)).to("cuda")
+    optim = config_optim(model, lr=6e-4, weight_decay=0.1)
+    train_data = DataLoaderLite(B=4, T=config.block_size)
+    lr_scheduler = get_lr_scheduler(max_lr=6e-4, min_lr=6e-5, warmup_steps=10, max_steps=50)
 
     model.train()
-    for i in range(50):
+    for step in range(50):
+        t0 = time.time()
+
         x, y = train_data.get_next_batch()
         x, y = x.to("cuda"), y.to("cuda")
-        loss = model.calc_loss(x, y)
         optim.zero_grad()
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            loss = model.calc_loss(x, y)
         loss.backward()
+        norm = clip_grad_norm_(model.parameters(), max_norm=1.0)
+        lr = lr_scheduler(step)
+        for param_group in optim.param_groups:
+            param_group["lr"] = lr
         optim.step()
-        print(loss.item())
 
-    completions = model.generate("Hello, I'm a language model,", n_sequences=4, max_length=64)
-    for c in completions:
-        print("<", c)
+        torch.cuda.synchronize()
+        t1 = time.time()
+        dt = t1 - t0
+        tokens_per_sec = (train_data.B * config.block_size) / dt
+        print(
+            f"step: {step:4d} | loss: {loss.item():.6f} | lr: {lr:.4e} | norm: {norm.item():.4f} | dt: {dt * 1000:.2f} ms | tok/sec: {tokens_per_sec:.2f}"
+        )
+
+    # completions = model.generate("Hello, I'm a language model,", n_sequences=4, max_length=64)
+    # for c in completions:
+    #     print("<", c)
