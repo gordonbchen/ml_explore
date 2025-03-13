@@ -79,11 +79,11 @@ class GPT(nn.Module):
         return loss
 
     @torch.no_grad()
-    def generate(self, prompt: str, n_sequences: int, max_length: int) -> list[str]:
+    def generate(self, prompt: str, n_sequences: int, max_length: int, device: str) -> list[str]:
         self.eval()
 
         tok = tiktoken.get_encoding("gpt2")
-        tokens = torch.tensor(tok.encode(prompt), dtype=torch.long, device="cuda")
+        tokens = torch.tensor(tok.encode(prompt), dtype=torch.long, device=device)
         tokens = tokens.unsqueeze(0).repeat(n_sequences, 1)
 
         while tokens.shape[-1] < max_length:
@@ -208,12 +208,12 @@ class MLP(nn.Module):
 
 
 class DataLoaderLite:
-    def __init__(self, B: int, T: int) -> None:
+    def __init__(self, B: int, T: int, device: str) -> None:
         self.B = B
         self.T = T
         tok = tiktoken.get_encoding("gpt2")
         text = self.get_shakespeare_data()
-        self.tokens = torch.tensor(tok.encode(text), device="cuda")
+        self.tokens = torch.tensor(tok.encode(text), device=device)
         print(f"# tokens: {len(self.tokens)}")
         print(f"batches per epoch: {len(self.tokens) // (B * T)}")
         self.curr_pos = 0
@@ -291,22 +291,39 @@ if __name__ == "__main__":
     torch.manual_seed(1337)
     torch.set_float32_matmul_precision("high")
 
+    device = "cuda"
+
     config = GPTConfig(vocab_size=50_304)
-    model = torch.compile(GPT(config)).to("cuda")
+    model = torch.compile(GPT(config)).to(device)
     optim = config_optim(model, lr=6e-4, weight_decay=0.1)
-    train_data = DataLoaderLite(B=4, T=config.block_size)
     lr_scheduler = get_lr_scheduler(max_lr=6e-4, min_lr=6e-5, warmup_steps=10, max_steps=50)
+
+    batch_size = 524_288  # 2**19, ~0.5M tokens.
+    B = 4  # micro batch size.
+    assert batch_size % (B * config.block_size) == 0, (
+        "batch_size must be divisible by tokens per micro batch"
+    )
+    grad_accum_steps = batch_size // (B * config.block_size)
+    print(
+        f"batch size (tok): {batch_size}, micro batch size (tok): {B * config.block_size}, grad accum steps: {grad_accum_steps}"
+    )
+    train_data = DataLoaderLite(B=B, T=config.block_size, device=device)
 
     model.train()
     for step in range(50):
         t0 = time.time()
 
-        x, y = train_data.get_next_batch()
-        x, y = x.to("cuda"), y.to("cuda")
-        optim.zero_grad()
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            loss = model.calc_loss(x, y)
-        loss.backward()
+        loss_accum = 0.0
+        for micro_step in range(grad_accum_steps):
+            x, y = train_data.get_next_batch()
+            x, y = x.to(device), y.to(device)
+            optim.zero_grad()
+            with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                loss = model.calc_loss(x, y)
+            loss = loss / grad_accum_steps
+            loss_accum += loss.item()
+            loss.backward()
+
         norm = clip_grad_norm_(model.parameters(), max_norm=1.0)
         lr = lr_scheduler(step)
         for param_group in optim.param_groups:
@@ -316,11 +333,13 @@ if __name__ == "__main__":
         torch.cuda.synchronize()
         t1 = time.time()
         dt = t1 - t0
-        tokens_per_sec = (train_data.B * config.block_size) / dt
+        tokens_per_sec = (B * config.block_size * grad_accum_steps) / dt
         print(
-            f"step: {step:4d} | loss: {loss.item():.6f} | lr: {lr:.4e} | norm: {norm.item():.4f} | dt: {dt * 1000:.2f} ms | tok/sec: {tokens_per_sec:.2f}"
+            f"step: {step:4d} | loss: {loss_accum:.6f} | lr: {lr:.4e} | norm: {norm.item():.4f} | dt: {dt * 1000:.2f} ms | tok/sec: {tokens_per_sec:.2f}"
         )
 
-    # completions = model.generate("Hello, I'm a language model,", n_sequences=4, max_length=64)
+    # completions = model.generate(
+    #     "Hello, I'm a language model,", n_sequences=4, max_length=64, device=device
+    # )
     # for c in completions:
     #     print("<", c)
