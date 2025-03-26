@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -9,8 +10,10 @@ from typing import Callable
 import requests
 import tiktoken
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
 from transformers import GPT2LMHeadModel
@@ -73,30 +76,6 @@ class GPT(nn.Module):
         logits = self.lm_head(x)
         return logits
 
-    def calc_loss(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        logits = self(x)
-        loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), y.view(-1))
-        return loss
-
-    @torch.no_grad()
-    def generate(self, prompt: str, n_sequences: int, max_length: int, device: str) -> list[str]:
-        self.eval()
-
-        tok = tiktoken.get_encoding("gpt2")
-        tokens = torch.tensor(tok.encode(prompt), dtype=torch.long, device=device)
-        tokens = tokens.unsqueeze(0).repeat(n_sequences, 1)
-
-        while tokens.shape[-1] < max_length:
-            logits = self(tokens[:, -self.config.block_size :])[:, -1, :]
-            probs = F.softmax(logits, dim=-1)
-            topk_probs, topk_inds = probs.topk(50, dim=-1)
-            inds = torch.multinomial(topk_probs, num_samples=1)
-            new_inds = topk_inds.gather(1, inds)
-            tokens = torch.cat((tokens, new_inds), dim=-1)
-
-        completions = tok.decode_batch(tokens.tolist())
-        return completions
-
     @torch.no_grad()
     @staticmethod
     def from_pretrained(model_name: str) -> GPT:
@@ -111,11 +90,7 @@ class GPT(nn.Module):
 
         model = GPT(config)
         sd = model.state_dict()
-        sd_keys = [
-            k
-            for k in sd.keys()
-            if not (k.endswith(".attn.causal_mask") or k.endswith("pos_arange"))
-        ]
+        sd_keys = [k for k in sd.keys() if not (k.endswith(".attn.causal_mask") or k.endswith("pos_arange"))]
 
         # BUG: hf fails to find cache if not running script in same dir.
         model_hf = GPT2LMHeadModel.from_pretrained(model_name)
@@ -130,15 +105,39 @@ class GPT(nn.Module):
 
         for k in sd_keys:
             if any(k.endswith(name) for name in transposed):
-                assert sd_hf[k].shape[::-1] == sd[k].shape, (
-                    "transposed shape doesn't match hugginface"
-                )
+                assert sd_hf[k].shape[::-1] == sd[k].shape, "transposed shape doesn't match hugginface"
                 sd[k].copy_(sd_hf[k].T)
             else:
                 assert sd_hf[k].shape == sd[k].shape, "shape doesn't match huggingface"
                 sd[k].copy_(sd_hf[k])
 
         return model
+
+
+def calc_loss(model: GPT, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    logits = model(x)
+    loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), y.view(-1))
+    return loss
+
+
+@torch.no_grad()
+def generate(model: GPT, prompt: str, n_sequences: int, max_length: int, device: str) -> list[str]:
+    model.eval()
+
+    tok = tiktoken.get_encoding("gpt2")
+    tokens = torch.tensor(tok.encode(prompt), dtype=torch.long, device=device)
+    tokens = tokens.unsqueeze(0).repeat(n_sequences, 1)
+
+    while tokens.shape[-1] < max_length:
+        logits = model(tokens[:, -model.config.block_size :])[:, -1, :]
+        probs = F.softmax(logits, dim=-1)
+        topk_probs, topk_inds = probs.topk(50, dim=-1)
+        inds = torch.multinomial(topk_probs, num_samples=1)
+        new_inds = topk_inds.gather(1, inds)
+        tokens = torch.cat((tokens, new_inds), dim=-1)
+
+    completions = tok.decode_batch(tokens.tolist())
+    return completions
 
 
 class Block(nn.Module):
@@ -165,28 +164,16 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embed, config.n_embed * 3)
         self.c_proj = nn.Linear(config.n_embed, config.n_embed)
         self.c_proj.RESIDUAL_SCALE_INIT = 1
-        # self.register_buffer(
-        #     "causal_mask",
-        #     torch.triu(
-        #         torch.full((1, 1, config.block_size, config.block_size), float("-inf")),
-        #         diagonal=1,
-        #     ),
-        # )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        q, k, v = self.c_attn(x).split(self.n_embed, dim=-1)
-
         B, T, C = x.shape
+
+        q, k, v = self.c_attn(x).split(self.n_embed, dim=-1)
         q = q.view(B, T, self.n_heads, self.head_size).transpose(1, 2)
         k = k.view(B, T, self.n_heads, self.head_size).transpose(1, 2)
         v = v.view(B, T, self.n_heads, self.head_size).transpose(1, 2)
 
-        # affin = (q @ k.transpose(-1, -2)) * (k.shape[-1] ** -0.5)
-        # affin = affin + self.causal_mask[:, :, :T, :T]
-        # affin = F.softmax(affin, dim=-1)
-        # y = affin @ v
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
         return y
@@ -208,24 +195,24 @@ class MLP(nn.Module):
 
 
 class DataLoaderLite:
-    def __init__(self, B: int, T: int, device: str) -> None:
+    def __init__(self, B: int, T: int, device: str, ddp_rank: int, ddp_world_size: int) -> None:
         self.B = B
         self.T = T
         tok = tiktoken.get_encoding("gpt2")
         text = self.get_shakespeare_data()
         self.tokens = torch.tensor(tok.encode(text), device=device)
-        print(f"# tokens: {len(self.tokens)}")
-        print(f"batches per epoch: {len(self.tokens) // (B * T)}")
-        self.curr_pos = 0
+        self.curr_pos = B * T * ddp_rank
+        self.ddp_rank = ddp_rank
+        self.ddp_world_size = ddp_world_size
 
     def get_next_batch(self) -> torch.Tensor:
         buf = self.tokens[self.curr_pos : self.curr_pos + (self.B * self.T) + 1]
         x = buf[:-1].view(self.B, self.T)
         y = buf[1:].view(self.B, self.T)
 
-        self.curr_pos += self.B * self.T
-        if (self.curr_pos + (self.B * self.T) + 1) > len(self.tokens):
-            self.curr_pos = 0
+        self.curr_pos += self.B * self.T * self.ddp_world_size
+        if (self.curr_pos + (self.B * self.T * self.ddp_world_size) + 1) > len(self.tokens):
+            self.curr_pos = self.B * self.T * self.ddp_rank
         return x, y
 
     def get_shakespeare_data(self, path: str = "data/tiny_shakespeare.txt") -> str:
@@ -244,9 +231,7 @@ class DataLoaderLite:
         return text
 
 
-def get_lr_scheduler(
-    max_lr: float, min_lr: float, warmup_steps: int, max_steps: int
-) -> Callable[[int], float]:
+def get_lr_scheduler(max_lr: float, min_lr: float, warmup_steps: int, max_steps: int) -> Callable[[int], float]:
     def lr_scheduler(step: int) -> float:
         if step < warmup_steps:
             return max_lr * (step + 1) / warmup_steps
@@ -261,7 +246,7 @@ def get_lr_scheduler(
     return lr_scheduler
 
 
-def config_optim(model: GPT, lr: float, weight_decay: float) -> AdamW:
+def config_optim(model: GPT, lr: float, weight_decay: float, master_process: bool) -> AdamW:
     decay_params = []
     no_decay_params = []
     for name, p in model.named_parameters():
@@ -272,11 +257,10 @@ def config_optim(model: GPT, lr: float, weight_decay: float) -> AdamW:
         else:
             no_decay_params.append(p)
 
-    print(f"Total params: {sum(p.numel() for p in model.parameters())}")
-    print(f"Decayed tensors, params: {len(decay_params)}, {sum(p.numel() for p in decay_params)}")
-    print(
-        f"Non-decayed tensors, params: {len(no_decay_params)}, {sum(p.numel() for p in no_decay_params)}"
-    )
+    if master_process:
+        print(f"Total params: {sum(p.numel() for p in model.parameters())}")
+        print(f"Decayed tensors, params: {len(decay_params)}, {sum(p.numel() for p in decay_params)}")
+        print(f"Non-decayed tensors, params: {len(no_decay_params)}, {sum(p.numel() for p in no_decay_params)}")
 
     optim_groups = [
         {"params": decay_params, "weight_decay": weight_decay},
@@ -288,41 +272,68 @@ def config_optim(model: GPT, lr: float, weight_decay: float) -> AdamW:
 
 
 if __name__ == "__main__":
+    ddp = "RANK" in os.environ
+    if ddp:
+        dist.init_process_group(backend="nccl")
+        ddp_rank = int(os.environ["RANK"])
+        ddp_local_rank = int(os.environ["LOCAL_RANK"])
+        ddp_world_size = int(os.environ["WORLD_SIZE"])
+        device = f"cuda:{ddp_local_rank}"
+        torch.cuda.set_device(device)
+        master_process = ddp_rank == 0
+    else:
+        ddp_rank = 0
+        ddp_local_rank = 0
+        ddp_world_size = 1
+        device = "cuda"
+        master_process = True
+
     torch.manual_seed(1337)
     torch.set_float32_matmul_precision("high")
 
-    device = "cuda"
-
     config = GPTConfig(vocab_size=50_304)
     model = torch.compile(GPT(config)).to(device)
-    optim = config_optim(model, lr=6e-4, weight_decay=0.1)
+    if ddp:
+        model = DDP(model, device_ids=[ddp_local_rank])
+    raw_model = model if not ddp else model.module
+
+    optim = config_optim(raw_model, lr=6e-4, weight_decay=0.1, master_process=master_process)
     lr_scheduler = get_lr_scheduler(max_lr=6e-4, min_lr=6e-5, warmup_steps=10, max_steps=50)
 
     batch_size = 524_288  # 2**19, ~0.5M tokens.
     B = 4  # micro batch size.
-    assert batch_size % (B * config.block_size) == 0, (
-        "batch_size must be divisible by tokens per micro batch"
+    assert batch_size % (B * config.block_size * ddp_world_size) == 0, (
+        "batch_size must be divisible by tokens per micro batch multiplied by ddp world size"
     )
-    grad_accum_steps = batch_size // (B * config.block_size)
-    print(
-        f"batch size (tok): {batch_size}, micro batch size (tok): {B * config.block_size}, grad accum steps: {grad_accum_steps}"
+    grad_accum_steps = batch_size // (B * config.block_size * ddp_world_size)
+    if master_process:
+        print(f"batch size (tok): {batch_size}, grad accum steps: {grad_accum_steps}")
+    train_data = DataLoaderLite(
+        B=B, T=config.block_size, device=device, ddp_rank=ddp_rank, ddp_world_size=ddp_world_size
     )
-    train_data = DataLoaderLite(B=B, T=config.block_size, device=device)
+    if master_process:
+        print(f"# tokens: {len(train_data.tokens)}")
+        print(f"micro batches per epoch: {len(train_data.tokens) // (B * config.block_size * ddp_world_size)}")
 
     model.train()
     for step in range(50):
         t0 = time.time()
 
-        loss_accum = 0.0
+        loss_accum = torch.tensor(0.0, dtype=torch.float32, device=device)
         for micro_step in range(grad_accum_steps):
             x, y = train_data.get_next_batch()
             x, y = x.to(device), y.to(device)
             optim.zero_grad()
             with torch.autocast(device_type=device, dtype=torch.bfloat16):
-                loss = model.calc_loss(x, y)
+                loss = calc_loss(model, x, y)
             loss = loss / grad_accum_steps
-            loss_accum += loss.item()
+            loss_accum += loss.detach()
+            if ddp:
+                model.require_backward_grad_sync = micro_step == (grad_accum_steps - 1)
             loss.backward()
+
+        if ddp:
+            dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
 
         norm = clip_grad_norm_(model.parameters(), max_norm=1.0)
         lr = lr_scheduler(step)
@@ -333,13 +344,16 @@ if __name__ == "__main__":
         torch.cuda.synchronize()
         t1 = time.time()
         dt = t1 - t0
-        tokens_per_sec = (B * config.block_size * grad_accum_steps) / dt
-        print(
-            f"step: {step:4d} | loss: {loss_accum:.6f} | lr: {lr:.4e} | norm: {norm.item():.4f} | dt: {dt * 1000:.2f} ms | tok/sec: {tokens_per_sec:.2f}"
-        )
+        tokens_per_sec = (B * config.block_size * ddp_world_size * grad_accum_steps) / dt
+        if master_process:
+            print(f"step: {step:4d} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | ", end="")
+            print(f"norm: {norm.item():.4f} | dt: {dt * 1000:.2f} ms | tok/sec: {tokens_per_sec:.2f}")
 
-    # completions = model.generate(
-    #     "Hello, I'm a language model,", n_sequences=4, max_length=64, device=device
+    if ddp:
+        dist.destroy_process_group()
+
+    # completions = generate(
+    #     model, "Hello, I'm a language model,", n_sequences=4, max_length=64, device=device
     # )
     # for c in completions:
     #     print("<", c)
