@@ -172,3 +172,7 @@ cython_debug/
 
 # training data
 data/
+
+# vscode config
+.vscode
+
