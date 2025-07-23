@@ -174,5 +174,5 @@ cython_debug/
 data/
 
 # vscode config
-.vscode
+.vscode/
 
